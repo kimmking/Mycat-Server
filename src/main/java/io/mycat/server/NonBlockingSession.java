@@ -232,8 +232,8 @@ public class NonBlockingSession implements Session {
             if(getXaTXID()!=null){
 				setXATXEnabled(false);
 			}
-            /* 2.  如果 autocommit 为  false,并且不自动开启新事务.则把autocommit 设置为true */
-            if(!source.isCreateNewTx()&&!source.isAutocommit()){
+            /* 2. preAcStates 为true,事务结束后,需要设置为true。preAcStates 为ac上一个状态    */
+            if(source.isPreAcStates()&&!source.isAutocommit()){
             	source.setAutocommit(true);
             }
             return;
@@ -276,8 +276,8 @@ public class NonBlockingSession implements Session {
             if(getXaTXID()!=null){
 				setXATXEnabled(false);
 			}
-            /* 2.  如果 autocommit 为  false,并且不自动开启新事务.则把autocommit 设置为true */
-            if(!source.isCreateNewTx()&&!source.isAutocommit()){
+            /* 2. preAcStates 为true,事务结束后,需要设置为true。preAcStates 为ac上一个状态    */
+            if(source.isPreAcStates()&&!source.isAutocommit()){
             	source.setAutocommit(true);
             }
             return;
@@ -317,7 +317,7 @@ public class NonBlockingSession implements Session {
 	 * 执行unlock tables语句方法
 	 * @author songdabin
 	 * @date 2016-7-9
-	 * @param rrs
+	 * @param sql
 	 */
 	public void unLockTable(String sql) {
 		UnLockTablesHandler handler = new UnLockTablesHandler(this, this.source.isAutocommit(), sql);
@@ -353,12 +353,26 @@ public class NonBlockingSession implements Session {
         RouteResultsetNode node = (RouteResultsetNode) conn.getAttachment();
 
         if (node != null) {
-            if (node.isDisctTable()) {
-                return;
-            }
-            if ((this.source.isAutocommit() || conn.isFromSlaveDB()
-                    || !conn.isModifiedSQLExecuted()) && !this.source.isLocked()) {
-                releaseConnection((RouteResultsetNode) conn.getAttachment(), LOGGER.isDebugEnabled(), needRollback);
+        	/*  分表 在
+        	 *    1. 没有开启事务
+        	 *    2. 读取走的从节点
+        	 *    3. 没有执行过更新sql
+        	 *    也需要释放连接
+        	 */
+//            if (node.isDisctTable()) {
+//                return;
+//            }
+            if (MycatServer.getInstance().getConfig().getSystem().isStrictTxIsolation()) {
+                // 如果是严格隔离级别模式的话,不考虑是否已经执行了modifiedSql,直接不释放连接
+                if ((!this.source.isAutocommit() && !conn.isFromSlaveDB()) || this.source.isLocked()) {
+                    return;
+                }
+            } else {
+                if ((this.source.isAutocommit() || conn.isFromSlaveDB()
+                             || !conn.isModifiedSQLExecuted()) && !this.source.isLocked()) {
+                    releaseConnection((RouteResultsetNode) conn.getAttachment(), LOGGER.isDebugEnabled(),
+                            needRollback);
+                }
             }
         }
     }
@@ -450,9 +464,9 @@ public class NonBlockingSession implements Session {
             conn.setAttachment(node);
             return true;
         } else {
-            // slavedb connection and can't use anymore ,release it
-            if (LOGGER.isDebugEnabled()) {
-                LOGGER.debug("release slave connection,can't be used in trasaction  "
+            // Previous connection and can't use anymore ,release it
+            if (LOGGER.isWarnEnabled()) {
+                LOGGER.warn("Release previous connection,can't be used in trasaction  "
                         + conn + " for " + node);
             }
             releaseConnection(node, LOGGER.isDebugEnabled(), false);
@@ -576,6 +590,7 @@ public class NonBlockingSession implements Session {
         this.prepared = prepared;
     }
 
+
 	public boolean isCanClose() {
 		return canClose;
 	}
@@ -592,5 +607,25 @@ public class NonBlockingSession implements Session {
 		this.middlerResultHandler = middlerResultHandler;
 	}
 
-    
+    public void setAutoCommitStatus() {
+		/* 1.  事务结束后,xa事务结束    */
+		if(this.getXaTXID()!=null){
+			this.setXATXEnabled(false);
+		}
+		/* 2. preAcStates 为true,事务结束后,需要设置为true。preAcStates 为ac上一个状态    */
+		if(this.getSource().isPreAcStates()&&!this.getSource().isAutocommit()){
+			this.getSource().setAutocommit(true);
+        }
+		this.getSource().clearTxInterrupt();
+
+    }
+	@Override
+	public String toString() {
+		// TODO Auto-generated method stub
+		StringBuilder sb = new StringBuilder();
+		for (BackendConnection backCon : target.values()) {
+			sb.append(backCon).append("\r\n");
+		}
+		return sb.toString();
+	}
 }

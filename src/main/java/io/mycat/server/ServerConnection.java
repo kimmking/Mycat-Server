@@ -31,20 +31,11 @@ import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.alibaba.druid.sql.ast.SQLStatement;
-import com.alibaba.druid.sql.dialect.mysql.parser.MySqlStatementParser;
-
 import io.mycat.MycatServer;
-import io.mycat.backend.mysql.DataType;
-import io.mycat.backend.mysql.nio.handler.MiddlerQueryResultHandler;
-import io.mycat.backend.mysql.nio.handler.MiddlerResultHandler;
-import io.mycat.backend.mysql.nio.handler.MultiNodeQueryHandler;
-import io.mycat.backend.mysql.nio.handler.SecondHandler;
 import io.mycat.config.ErrorCode;
 import io.mycat.config.model.SchemaConfig;
 import io.mycat.net.FrontendConnection;
 import io.mycat.route.RouteResultset;
-import io.mycat.route.parser.druid.MycatSchemaStatVisitor;
 import io.mycat.server.handler.MysqlInformationSchemaHandler;
 import io.mycat.server.handler.MysqlProcHandler;
 import io.mycat.server.parser.ServerParse;
@@ -65,7 +56,7 @@ public class ServerConnection extends FrontendConnection {
 
 	private volatile int txIsolation;
 	private volatile boolean autocommit;
-	private volatile boolean createNewTx; //事务提交或回滚后,是否自动开启新事务. true时，开启新事务,false时,不开启新事务
+	private volatile boolean preAcStates; //上一个ac状态,默认为true
 	private volatile boolean txInterrupted;
 	private volatile String txInterrputMsg = "";
 	private long lastInsertId;
@@ -74,12 +65,13 @@ public class ServerConnection extends FrontendConnection {
 	 * 标志是否执行了lock tables语句，并处于lock状态
 	 */
 	private volatile boolean isLocked = false;
-
+	
 	public ServerConnection(NetworkChannel channel)
 			throws IOException {
 		super(channel);
 		this.txInterrupted = false;
 		this.autocommit = true;
+		this.preAcStates = true;
 	}
 
 	@Override
@@ -125,7 +117,18 @@ public class ServerConnection extends FrontendConnection {
 			this.txInterrputMsg = txInterrputMsg;
 		}
 	}
-
+	
+	/**
+	 * 
+	 * 清空食事务中断
+	 * */
+	public void clearTxInterrupt() {
+		if (!autocommit && txInterrupted) {
+			txInterrupted = false;
+			this.txInterrputMsg = "";
+		}
+	}
+	
 	public boolean isTxInterrupted()
 	{
 		return txInterrupted;
@@ -175,19 +178,23 @@ public class ServerConnection extends FrontendConnection {
 		if (db == null) {
 			db = SchemaUtil.detectDefaultDb(sql, type);
 			if (db == null) {
-				writeErrMessage(ErrorCode.ERR_BAD_LOGICDB, "No MyCAT Database selected");
-				return;
+				db = MycatServer.getInstance().getConfig().getUsers().get(user).getDefaultSchema();
+				if (db == null) {
+					writeErrMessage(ErrorCode.ERR_BAD_LOGICDB,
+							"No MyCAT Database selected");
+					return ;
+				}
 			}
 			isDefault = false;
 		}
 		
 		// 兼容PhpAdmin's, 支持对MySQL元数据的模拟返回
 		//// TODO: 2016/5/20 支持更多information_schema特性
-		if (ServerParse.SELECT == type 
-				&& db.equalsIgnoreCase("information_schema") ) {
-			MysqlInformationSchemaHandler.handle(sql, this);
-			return;
-		}
+//		if (ServerParse.SELECT == type
+//				&& db.equalsIgnoreCase("information_schema") ) {
+//			MysqlInformationSchemaHandler.handle(sql, this);
+//			return;
+//		}
 
 		if (ServerParse.SELECT == type 
 				&& sql.contains("mysql") 
@@ -244,9 +251,16 @@ public class ServerConnection extends FrontendConnection {
 		// 检查当前使用的DB
 		String db = this.schema;
 		if (db == null) {
-			writeErrMessage(ErrorCode.ERR_BAD_LOGICDB,
-					"No MyCAT Database selected");
-			return null;
+			db = SchemaUtil.detectDefaultDb(sql, type);
+			if (db == null){
+				db = MycatServer.getInstance().getConfig().getUsers().get(user).getDefaultSchema();
+				if (db == null) {
+					writeErrMessage(ErrorCode.ERR_BAD_LOGICDB,
+							"No MyCAT Database selected");
+					return null;
+				}
+			}
+
 		}
 		SchemaConfig schema = MycatServer.getInstance().getConfig()
 				.getSchemas().get(db);
@@ -307,8 +321,10 @@ public class ServerConnection extends FrontendConnection {
 	 */
 	public void commit() {
 		if (txInterrupted) {
-			writeErrMessage(ErrorCode.ER_YES,
-					"Transaction error, need to rollback.");
+			LOGGER.warn("receive commit ,but found err message in Transaction {}",this);
+			this.rollback();
+//			writeErrMessage(ErrorCode.ER_YES,
+//					"Transaction error, need to rollback.");
 		} else {
 			session.commit();
 		}
@@ -405,17 +421,20 @@ public class ServerConnection extends FrontendConnection {
 	}
 	@Override
 	public String toString() {
+		
 		return "ServerConnection [id=" + id + ", schema=" + schema + ", host="
 				+ host + ", user=" + user + ",txIsolation=" + txIsolation
-				+ ", autocommit=" + autocommit + ", schema=" + schema + "]";
+				+ ", autocommit=" + autocommit + ", schema=" + schema+ ", executeSql=" + executeSql + "]" +
+				this.getSession2();
+		
 	}
 
-	public boolean isCreateNewTx() {
-		return createNewTx;
+	public boolean isPreAcStates() {
+		return preAcStates;
 	}
 
-	public void setCreateNewTx(boolean createNewTx) {
-		this.createNewTx = createNewTx;
+	public void setPreAcStates(boolean preAcStates) {
+		this.preAcStates = preAcStates;
 	}
 
 }

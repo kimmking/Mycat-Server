@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+
 import java.util.concurrent.atomic.AtomicBoolean;
 
 
@@ -68,6 +69,10 @@ public class DataNodeMergeManager extends AbstractDataNodeMerge {
      */
     private final  int limitStart;
     private final  int limitSize;
+    
+    private int[] mergeColsIndex;
+    private boolean hasEndFlag = false;
+    
 
     private AtomicBoolean isMiddleResultDone;
     public DataNodeMergeManager(MultiNodeQueryHandler handler, RouteResultset rrs,AtomicBoolean isMiddleResultDone) {
@@ -182,9 +187,18 @@ public class DataNodeMergeManager extends AbstractDataNodeMerge {
             /**
              * Group操作
              */
+            MergeCol[] mergColsArrays = mergCols.toArray(new MergeCol[mergCols.size()]);
             unsafeRowGrouper = new UnsafeRowGrouper(columToIndx,rrs.getGroupByCols(),
-                    mergCols.toArray(new MergeCol[mergCols.size()]),
+            		mergColsArrays,
                     rrs.getHavingCols());
+            
+            if(mergColsArrays!=null&&mergColsArrays.length>0){
+    			mergeColsIndex = new int[mergColsArrays.length];
+    			for(int i = 0;i<mergColsArrays.length;i++){
+    				mergeColsIndex[i] = mergColsArrays[i].colMeta.colIndex;
+    			}
+    			Arrays.sort(mergeColsIndex);
+    		}
         }
 
 
@@ -330,6 +344,8 @@ public class DataNodeMergeManager extends AbstractDataNodeMerge {
     private UnsafeRowWriter unsafeRowWriter = null;
     private  int Index = 0;
 
+    private volatile int clearStatus = ClearStatusEnum.INIT;
+
     @Override
     public void run() {
 
@@ -341,13 +357,25 @@ public class DataNodeMergeManager extends AbstractDataNodeMerge {
 
         try {
             for (; ; ) {
+                if(clearStatus == ClearStatusEnum.PREPARE_CLEAR
+                        || clearStatus == ClearStatusEnum.CLEARED) {
+                    break;
+                }
                 final PackWraper pack = packs.poll();
 
                 if (pack == null) {
                     nulpack = true;
                     break;
                 }
+
                 if (pack == END_FLAG_PACK) {
+                	
+                	hasEndFlag = true;
+                	
+                	if(packs.peek()!=null){
+                		packs.add(pack);
+                		continue;
+                	}
                 	
                      /**
                      * 最后一个节点datenode发送了row eof packet说明了整个
@@ -403,15 +431,35 @@ public class DataNodeMergeManager extends AbstractDataNodeMerge {
                  *构造一行row，将对应的col填充.
                  */
                 MySQLMessage mm = new MySQLMessage(pack.rowData);
+                
+                unsafeRowWriter.grow((mm.getRowLength(fieldCount) + 1 ) / 2);
                 mm.readUB3();
                 mm.read();
-
+                
+                int nullnum = 0;
                 for (int i = 0; i < fieldCount; i++) {
                     byte[] colValue = mm.readBytesWithLength();
                     if (colValue != null)
                     	unsafeRowWriter.write(i,colValue);
                     else
-                        unsafeRow.setNullAt(i);
+                    {
+            	 		if(mergeColsIndex!=null&&mergeColsIndex.length>0){
+            	 			
+            	 			if(Arrays.binarySearch(mergeColsIndex, i)<0){
+            	 				nullnum++;
+        	             	}
+            	 		}
+            	 		unsafeRow.setNullAt(i);
+                    }
+                }
+                
+                if(mergeColsIndex!=null&&mergeColsIndex.length>0){
+                	if(nullnum == (fieldCount - mergeColsIndex.length)){
+                		if(!hasEndFlag){
+                			packs.add(pack);
+                        	continue;
+                		}
+                    }
                 }
 
                 unsafeRow.setTotalSize(bufferHolder.totalSize());
@@ -433,28 +481,48 @@ public class DataNodeMergeManager extends AbstractDataNodeMerge {
         	e.printStackTrace();
             multiQueryHandler.handleDataProcessException(e);
         } finally {
-            running.set(false);
+            synchronized (this) {
+                running.set(false);
+                if(clearStatus == ClearStatusEnum.PREPARE_CLEAR){
+                    clear();
+                    return ;
+                }
+            }
             if (nulpack && !packs.isEmpty()) {
                 this.run();
             }
         }
     }
-
     /**
      * 释放DataNodeMergeManager所申请的资源
      */
     public void clear() {
 
-        unsafeRows.clear();
-
-        synchronized (this)
-        {
-            if (unsafeRowGrouper != null) {
-                unsafeRowGrouper.free();
-                unsafeRowGrouper = null;
+        if(clearStatus == ClearStatusEnum.INIT) {
+            synchronized (this){
+                if(clearStatus == ClearStatusEnum.INIT && running.get() == true ) {
+                    clearStatus = ClearStatusEnum.PREPARE_CLEAR;
+                }
             }
         }
 
+        boolean flag = false;
+        synchronized (this) {
+            if(clearStatus == ClearStatusEnum.CLEARED || running.get() == true){
+                return;
+            }
+            clearStatus = ClearStatusEnum.CLEARED;
+            flag = true;
+
+        }
+        if(!flag){
+            return ;
+        }
+        unsafeRows.clear();
+        if (unsafeRowGrouper != null) {
+            unsafeRowGrouper.free();
+            unsafeRowGrouper = null;
+        }
         if(globalSorter != null){
             globalSorter.cleanupResources();
             globalSorter = null;
@@ -466,3 +534,9 @@ public class DataNodeMergeManager extends AbstractDataNodeMerge {
         }
     }
 }
+class ClearStatusEnum {
+    public static int INIT = -1;
+    public static int PREPARE_CLEAR = 1;
+    public static int CLEARED  = 2;
+}
+
